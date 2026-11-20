@@ -192,6 +192,8 @@ function App() {
   const MQTT_BROKER = import.meta.env.VITE_MQTT_BROKER_URL || "wss://broker.hivemq.com:8884/mqtt";
   const MQTT_TOPIC = import.meta.env.VITE_MQTT_TOPIC || "acoustic-leak-detection/sensor-data";
 
+  const lastFeedEventRef = useRef({ key: "", ts: 0 });
+
   useEffect(() => {
     const API_BASE = import.meta.env.VITE_API_URL || "";
     let mqttClient = null;
@@ -344,6 +346,15 @@ function App() {
       }
 
       // Add to incoming real-time MQTT events feed
+      // The same reading can arrive via both the browser MQTT client and the
+      // backend Socket.io relay, so skip a repeat of the same node + status
+      // seen within the last 3 seconds.
+      const eventKey = `${String(nodeId).toLowerCase()}|${isLeak ? "leak" : "normal"}`;
+      const nowMs = Date.now();
+      const last = lastFeedEventRef.current;
+      if (last.key === eventKey && nowMs - last.ts < 3000) return;
+      lastFeedEventRef.current = { key: eventKey, ts: nowMs };
+
       const eventTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       setMqttEvents((prev) => [
         {
