@@ -55,6 +55,20 @@ export const getApiBase = () => {
 
 const MQTT_TOPIC = "compressed-air/node1/data";
 
+function latestAlertsByNode(alerts) {
+  const sorted = [...alerts].sort((a, b) =>
+    Number(b.state === "active") - Number(a.state === "active") ||
+    new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+  );
+  const seen = new Set();
+  return sorted.filter((alert) => {
+    const node = normalizeNodeId(alert.node || alert.node_id) || alert.id;
+    if (seen.has(node)) return false;
+    seen.add(node);
+    return true;
+  });
+}
+
 function App() {
   const [activePage, setActivePage] = useState("dashboard");
 
@@ -62,7 +76,7 @@ function App() {
   const [alerts, setAlerts] = useState(() => {
     try {
       const saved = localStorage.getItem("cached_alerts");
-      return saved ? JSON.parse(saved) : [];
+      return saved ? latestAlertsByNode(JSON.parse(saved)) : [];
     } catch {
       return [];
     }
@@ -205,6 +219,7 @@ function App() {
   useEffect(() => {
     const API_BASE = getApiBase();
     let mqttClient = null;
+    let socket = null;
 
     // Helper: Process incoming telemetry from ESP32 via MQTT (or fallback REST / Socket.io)
     const processTelemetry = (data) => {
@@ -290,19 +305,18 @@ function App() {
         return updated;
       });
 
-      // If leak detected, update existing active alert for this node or create one if none exists
-      if (isLeak) {
+      // Use local alerts when no backend socket is connected.
+      if (isLeak && !socket?.connected) {
         const severity = alertInfo?.severity || (numericSound >= 85.0 ? "critical" : "warning");
         const title = alertInfo?.title || (severity === "critical" ? "Critical Air Leak" : "Air Leak Warning");
         const description = alertInfo?.description || `High acoustic level detected: ${numericSound.toFixed(1)} dB on ${resolvedNodeId}`;
 
         setAlerts((currentAlerts) => {
           const existingIdx = currentAlerts.findIndex((a) => {
-            return isSameNode(a.node || a.node_id, resolvedNodeId) && a.state === "active";
+            return isSameNode(a.node || a.node_id, resolvedNodeId);
           });
 
           if (existingIdx >= 0) {
-            // Update existing active alert in place
             const updated = [...currentAlerts];
             updated[existingIdx] = {
               ...updated[existingIdx],
@@ -312,13 +326,15 @@ function App() {
               soundLevel: numericSound,
               threshold: numericThreshold,
               description,
-              createdAt: new Date().toISOString(),
+              state: "active",
+              resolvedAt: null,
+              createdAt: updated[existingIdx].state === "active"
+                ? updated[existingIdx].createdAt : new Date().toISOString(),
             };
             try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch {}
             return updated;
           }
 
-          // Create a new alert only if no active alert exists for this node
           const newAlert = {
             id: `alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             node: resolvedNodeId,
@@ -433,7 +449,6 @@ function App() {
     connectHiveMQ();
 
     // 2. Connect to Socket.io backend if API_BASE is configured
-    let socket = null;
     if (API_BASE) {
       try {
         socket = io(API_BASE, { autoConnect: true });
@@ -479,7 +494,7 @@ function App() {
           setAlerts((currentAlerts) => {
             const existingIdx = currentAlerts.findIndex((a) => {
               if (a.id === newAlert.id) return true;
-              return isSameNode(a.node || a.node_id, targetNode) && a.state === "active";
+              return isSameNode(a.node || a.node_id, targetNode);
             });
 
             let updated;
@@ -497,6 +512,11 @@ function App() {
             return updated;
           });
 
+          setSelectedAlert((current) =>
+            current && (current.id === newAlert.id || isSameNode(current.node, targetNode))
+              ? { ...current, ...newAlert, node: targetNode || current.node }
+              : current
+          );
           setLeakDetected(true);
 
           if (targetNode) {
@@ -641,9 +661,10 @@ function App() {
         .then((r) => r.json())
         .then((data) => {
           if (Array.isArray(data)) {
-            setAlerts(data);
-            try { localStorage.setItem("cached_alerts", JSON.stringify(data)); } catch {}
-            const hasActive = data.some((a) => a.state === "active");
+            const currentAlerts = latestAlertsByNode(data);
+            setAlerts(currentAlerts);
+            try { localStorage.setItem("cached_alerts", JSON.stringify(currentAlerts)); } catch {}
+            const hasActive = currentAlerts.some((a) => a.state === "active");
             setLeakDetected(hasActive);
           }
         })
@@ -915,7 +936,7 @@ function App() {
 
             <AlertsPage
               alerts={alerts}
-              selectedAlert={selectedAlert}
+              selectedAlert={alerts.find((alert) => alert.id === selectedAlert?.id) || selectedAlert}
               setSelectedAlert={setSelectedAlert}
               resolveAlert={resolveAlert}
               deleteAlert={deleteAlert}

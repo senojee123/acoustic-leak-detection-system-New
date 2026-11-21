@@ -1,3 +1,4 @@
+import { formatAlert, recordLeakStart, upsertNodeAlert } from '../services/alertStore.js';
 import { isPostgresConnected, pool, inMemoryStore } from '../config/db.js';
 import {
   broadcastAlertResolved,
@@ -14,11 +15,11 @@ export async function getAlerts(req, res) {
 
   try {
     if (isPostgresConnected && pool) {
-      let queryText = 'SELECT * FROM alerts';
+      let queryText = "SELECT * FROM alerts WHERE state <> 'superseded'";
       const params = [];
 
       if (state) {
-        queryText += ' WHERE state = $1';
+        queryText += ' AND state = $1';
         params.push(state);
       }
       queryText += ' ORDER BY created_at DESC';
@@ -74,7 +75,7 @@ export async function resolveAlert(req, res) {
       const updateResult = await pool.query(
         `UPDATE alerts 
          SET state = 'resolved', resolved_at = NOW() 
-         WHERE id = $1 
+         WHERE id = $1 AND state <> 'superseded'
          RETURNING *`,
         [id]
       );
@@ -203,91 +204,27 @@ export async function createAlert(req, res) {
     return res.status(400).json({ error: 'node and soundLevel are required' });
   }
 
-  const alertId = `alert${Date.now()}`;
   const alertTitle = title || (severity === 'critical' ? 'Critical Air Leak' : 'Air Leak Warning');
   const alertDesc = description || `Acoustic level reached ${soundLevel} dB exceeding ${threshold} dB`;
 
   try {
-    let createdAlert = null;
+    const { alert, started } = await upsertNodeAlert({
+      nodeId: node, title: alertTitle, severity, soundLevel, threshold, description: alertDesc,
+    });
+    const createdAlert = formatAlert(alert);
 
     if (isPostgresConnected && pool) {
-      const result = await pool.query(
-        `INSERT INTO alerts (id, node_id, title, severity, sound_level, threshold, state, description, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, NOW())
-         RETURNING *`,
-        [alertId, node, alertTitle, severity, soundLevel, threshold, alertDesc]
-      );
-
-      // Update node status to leak
-      await pool.query(`UPDATE nodes SET status = 'leak', sound_level = $1, last_seen = NOW() WHERE id = $2`, [soundLevel, node]);
-
-      // Add to history
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const historyRow = {
-        id: `h${Date.now()}`,
-        time: `Today, ${nowStr}`,
-        node,
-        event: 'Leak Event Detected',
-        status: 'leak',
-        createdAt: new Date().toISOString(),
-      };
-      await pool.query(
-        `INSERT INTO history (id, time, node, event, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [historyRow.id, historyRow.time, historyRow.node, historyRow.event, historyRow.status]
-      );
-      broadcastHistoryNew(historyRow);
-
-      const row = result.rows[0];
-      createdAlert = {
-        id: row.id,
-        node: row.node_id,
-        title: row.title,
-        severity: row.severity,
-        soundLevel: parseFloat(row.sound_level),
-        threshold: parseFloat(row.threshold),
-        state: row.state,
-        description: row.description,
-        createdAt: row.created_at,
-      };
+      await pool.query("UPDATE nodes SET status = 'leak', sound_level = $1, last_seen = NOW() WHERE id = $2", [soundLevel, node]);
     } else {
-      createdAlert = {
-        id: alertId,
-        node_id: node,
-        node: node,
-        title: alertTitle,
-        severity,
-        sound_level: soundLevel,
-        soundLevel,
-        threshold,
-        state: 'active',
-        description: alertDesc,
-        created_at: new Date(),
-        createdAt: new Date(),
-      };
-
-      inMemoryStore.alerts.unshift(createdAlert);
-
       const nodeObj = inMemoryStore.nodes.find(n => n.id === node);
       if (nodeObj) {
         nodeObj.status = 'leak';
         nodeObj.sound_level = soundLevel;
         nodeObj.last_seen = new Date();
       }
-
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const historyRow = {
-        id: `h${Date.now()}`,
-        time: `Today, ${nowStr}`,
-        node,
-        event: 'Leak Event Detected',
-        status: 'leak',
-        created_at: new Date(),
-        createdAt: new Date().toISOString(),
-      };
-      inMemoryStore.history.unshift(historyRow);
-      broadcastHistoryNew(historyRow);
     }
+
+    if (started) await recordLeakStart(alert);
 
     broadcastAlertNew(createdAlert);
     broadcastNodeStatus({ id: node, status: 'leak', soundLevel });

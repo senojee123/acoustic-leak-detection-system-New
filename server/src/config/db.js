@@ -34,6 +34,7 @@ export async function initDb() {
     return;
   }
 
+  let client;
   try {
     const isProduction = process.env.NODE_ENV === 'production' || databaseUrl.includes('railway');
     pool = new Pool({
@@ -44,10 +45,11 @@ export async function initDb() {
       connectionTimeoutMillis: 5000,
     });
 
-    const client = await pool.connect();
+    client = await pool.connect();
     console.log(' Connected successfully to PostgreSQL database!');
 
     // Initialize Schema
+    await client.query('BEGIN');
     await client.query(`
       CREATE TABLE IF NOT EXISTS nodes (
         id VARCHAR(50) PRIMARY KEY,
@@ -77,6 +79,22 @@ export async function initDb() {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         resolved_at TIMESTAMPTZ
       );
+
+      LOCK TABLE alerts IN SHARE ROW EXCLUSIVE MODE;
+      WITH ranked_alerts AS (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY LOWER(node_id)
+          ORDER BY (state = 'active') DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+        ) AS position
+        FROM alerts
+        WHERE node_id IS NOT NULL AND state <> 'superseded'
+      )
+      UPDATE alerts SET state = 'superseded'
+      FROM ranked_alerts
+      WHERE alerts.id = ranked_alerts.id AND ranked_alerts.position > 1;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS alerts_current_node_idx ON alerts (LOWER(node_id))
+      WHERE state <> 'superseded';
 
       CREATE TABLE IF NOT EXISTS history (
         id VARCHAR(50) PRIMARY KEY,
@@ -110,12 +128,15 @@ export async function initDb() {
       ['config', JSON.stringify(inMemoryStore.settings)]
     );
 
-    client.release();
+    await client.query('COMMIT');
     isPostgresConnected = true;
   } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('❌ Failed to connect to PostgreSQL:', err.message);
     console.log('👉 Falling back to in-memory store so server continues running.');
     isPostgresConnected = false;
+  } finally {
+    client?.release();
   }
 }
 

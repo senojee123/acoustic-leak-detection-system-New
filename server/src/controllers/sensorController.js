@@ -1,5 +1,6 @@
+import { formatAlert, recordLeakStart, upsertNodeAlert } from '../services/alertStore.js';
 import { isPostgresConnected, pool, inMemoryStore } from '../config/db.js';
-import { broadcastSensorUpdate, broadcastAlertNew, broadcastNodeStatus, broadcastHistoryNew } from '../services/socketService.js';
+import { broadcastSensorUpdate, broadcastAlertNew, broadcastNodeStatus } from '../services/socketService.js';
 import { deletedNodeIds } from './nodeController.js';
 
 let latestReading = null;
@@ -152,76 +153,6 @@ export async function ingestReading(req, res) {
          WHERE LOWER(id) = LOWER($3)`,
         [numericSound, leakDetected ? 'leak' : 'normal', nodeId]
       );
-
-      // If leak detected, update existing active alert for this node or create one if none exists
-      if (leakDetected) {
-        const title = body.alert?.title || (status === "critical" ? "Critical Air Leak" : "Air Leak Warning");
-        const desc = body.alert?.description || `High acoustic level detected: ${numericSound} dB on ${nodeId}`;
-
-        const existingAlertRes = await pool.query(
-          `SELECT * FROM alerts WHERE LOWER(node_id) = LOWER($1) AND state = 'active' ORDER BY created_at DESC LIMIT 1`,
-          [nodeId]
-        );
-
-        let alertRow;
-        if (existingAlertRes.rows.length > 0) {
-          // Update existing active alert
-          const existingAlert = existingAlertRes.rows[0];
-          const updatedAlertRes = await pool.query(
-            `UPDATE alerts
-             SET sound_level = $1,
-                 threshold = $2,
-                 title = $3,
-                 severity = $4,
-                 description = $5,
-                 created_at = NOW()
-             WHERE id = $6
-             RETURNING *`,
-            [numericSound, numericThreshold, title, status, desc, existingAlert.id]
-          );
-          alertRow = updatedAlertRes.rows[0];
-        } else {
-          // Create new alert only if no active alert exists for this node
-          const alertId = `alert${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          const newAlertRes = await pool.query(
-            `INSERT INTO alerts (id, node_id, title, severity, sound_level, threshold, state, description, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, NOW())
-             RETURNING *`,
-            [alertId, nodeId, title, status, numericSound, numericThreshold, desc]
-          );
-          alertRow = newAlertRes.rows[0];
-
-          // Log to history only when new alert starts
-          const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          const historyRecord = {
-            id: `h${Date.now()}`,
-            time: `Today, ${nowStr}`,
-            node: nodeId,
-            event: 'Leak Event Detected',
-            status: 'leak',
-            createdAt: new Date().toISOString(),
-          };
-          await pool.query(
-            `INSERT INTO history (id, time, node, event, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())`,
-            [historyRecord.id, historyRecord.time, historyRecord.node, historyRecord.event, historyRecord.status]
-          );
-          broadcastHistoryNew(historyRecord);
-        }
-
-        broadcastAlertNew({
-          id: alertRow.id,
-          node: alertRow.node_id,
-          node_id: alertRow.node_id,
-          title: alertRow.title,
-          severity: alertRow.severity,
-          soundLevel: parseFloat(alertRow.sound_level),
-          threshold: parseFloat(alertRow.threshold),
-          state: alertRow.state,
-          description: alertRow.description,
-          createdAt: alertRow.created_at,
-        });
-      }
     } else {
       // In-memory fallback: update registered node
       const nodeObj = inMemoryStore.nodes.find(n => n.id.toLowerCase() === nodeId.toLowerCase());
@@ -230,60 +161,19 @@ export async function ingestReading(req, res) {
         nodeObj.status = leakDetected ? 'leak' : 'normal';
         nodeObj.last_seen = new Date();
       }
+    }
 
-      if (leakDetected) {
-        const title = body.alert?.title || (status === "critical" ? "Critical Air Leak" : "Air Leak Warning");
-        const desc = body.alert?.description || `High acoustic level detected: ${numericSound} dB on ${nodeId}`;
-
-        const existingAlert = inMemoryStore.alerts.find(
-          (a) => (a.node_id?.toLowerCase() === nodeId.toLowerCase() || a.node?.toLowerCase() === nodeId.toLowerCase()) && a.state === 'active'
-        );
-
-        let alertObj;
-        if (existingAlert) {
-          existingAlert.sound_level = numericSound;
-          existingAlert.soundLevel = numericSound;
-          existingAlert.threshold = numericThreshold;
-          existingAlert.title = title;
-          existingAlert.severity = body.alert?.severity || status;
-          existingAlert.description = desc;
-          existingAlert.created_at = new Date();
-          existingAlert.createdAt = new Date();
-          alertObj = existingAlert;
-        } else {
-          const alertId = `alert${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          alertObj = {
-            id: alertId,
-            node_id: nodeId,
-            node: nodeId,
-            title,
-            severity: body.alert?.severity || status,
-            sound_level: numericSound,
-            soundLevel: numericSound,
-            threshold: numericThreshold,
-            state: "active",
-            description: desc,
-            created_at: new Date(),
-            createdAt: new Date(),
-          };
-          inMemoryStore.alerts.unshift(alertObj);
-
-          const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          const historyRecord = {
-            id: `h${Date.now()}`,
-            time: `Today, ${nowStr}`,
-            node: nodeId,
-            event: 'Leak Event Detected',
-            status: 'leak',
-            created_at: new Date(),
-            createdAt: new Date().toISOString(),
-          };
-          inMemoryStore.history.unshift(historyRecord);
-          broadcastHistoryNew(historyRecord);
-        }
-
-        broadcastAlertNew(alertObj);
-      }
+    if (leakDetected) {
+      const { alert, started } = await upsertNodeAlert({
+        nodeId,
+        title: body.alert?.title || (status === 'critical' ? 'Critical Air Leak' : 'Air Leak Warning'),
+        severity: body.alert?.severity || status,
+        soundLevel: numericSound,
+        threshold: numericThreshold,
+        description: body.alert?.description || `High acoustic level detected: ${numericSound} dB on ${nodeId}`,
+      });
+      broadcastAlertNew(formatAlert(alert));
+      if (started) await recordLeakStart(alert);
     }
 
     // Broadcast real-time sensor updates to all connected clients
