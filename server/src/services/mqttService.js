@@ -6,20 +6,7 @@ let mqttClient = null;
 let mqttConnected = false;
 let ioRef = null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MQTT TOPIC STRUCTURE (matches ESP32 firmware)
-//
-//  compressed-air/sensor        → raw reading { nodeId, soundLevel, leakDetected }
-//  compressed-air/node/+/status → node heartbeat  { nodeId, status, soundLevel }
-//  compressed-air/alert         → alert event     { nodeId, title, severity, description }
-// ─────────────────────────────────────────────────────────────────────────────
-
-export const TOPICS = {
-  TELEMETRY:   process.env.MQTT_TOPIC || 'acoustic-leak-detection/sensor-data',
-  SENSOR:      'compressed-air/sensor',
-  NODE_STATUS: 'compressed-air/node/+/status',
-  ALERT:       'compressed-air/alert',
-};
+export const MQTT_TOPIC = 'compressed-air/node1/data';
 
 /**
  * Connect to HiveMQ broker and wire up message handlers.
@@ -58,12 +45,11 @@ export function initMqtt(io) {
     mqttConnected = true;
     console.log('✅ [MQTT] Connected to HiveMQ!');
 
-    // Subscribe to all topics (single topic + legacy)
-    mqttClient.subscribe(Object.values(TOPICS), { qos: 0 }, (err) => {
+    mqttClient.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
       if (err) {
         console.error('❌ [MQTT] Subscribe error:', err.message);
       } else {
-        console.log('📡 [MQTT] Subscribed to topic:', TOPICS.TELEMETRY);
+        console.log('📡 [MQTT] Subscribed to topic:', MQTT_TOPIC);
       }
     });
 
@@ -90,6 +76,8 @@ export function initMqtt(io) {
 
   // ─── Message Handler ────────────────────────────────────────────────────
   mqttClient.on('message', async (topic, payload) => {
+    if (topic !== MQTT_TOPIC) return;
+
     let data;
     try {
       data = JSON.parse(payload.toString());
@@ -100,20 +88,7 @@ export function initMqtt(io) {
 
     console.log(`[MQTT] 📨 ${topic}:`, JSON.stringify(data));
 
-    // ── 1. Unified Single Telemetry Topic ────────────────────────────────
-    if (topic === TOPICS.TELEMETRY || topic === TOPICS.SENSOR) {
-      await handleSensorReading(data);
-    }
-
-    // ── 2. Node status heartbeat ────────────────────────────────────────
-    else if (topic.startsWith('compressed-air/node/') && topic.endsWith('/status')) {
-      await handleNodeStatus(data, topic);
-    }
-
-    // ── 3. Alert event ──────────────────────────────────────────────────
-    else if (topic === TOPICS.ALERT) {
-      await handleAlertEvent(data);
-    }
+    if (data && typeof data === 'object') await handleSensorReading(data);
   });
 }
 
@@ -191,123 +166,6 @@ async function handleSensorReading(data) {
   } catch (err) {
     console.error('[MQTT] Error ingesting sensor reading:', err.message);
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  HANDLER: Node heartbeat  { nodeId, status, soundLevel }
-// ─────────────────────────────────────────────────────────────────────────────
-async function handleNodeStatus(data, topic) {
-  const { nodeId: rawNodeId, status = 'normal', soundLevel } = data;
-  if (!rawNodeId) return;
-
-  // Block message if node is not registered
-  const matchedNode = await getRegisteredNode(rawNodeId);
-  if (!matchedNode) {
-    console.warn(`🛑 [MQTT] Blocked node status: Node "${rawNodeId}" is not registered.`);
-    return;
-  }
-  const nodeId = matchedNode.id;
-
-  try {
-    // Update PostgreSQL node record
-    await query(
-      `UPDATE nodes SET status = $1, sound_level = $2, last_seen = NOW() WHERE LOWER(id) = LOWER($3)`,
-      [status, soundLevel ?? 0, nodeId]
-    );
-  } catch {
-    // In-memory fallback
-    const node = inMemoryStore.nodes.find(n => isSameNode(n.id, nodeId));
-    if (node) {
-      node.status = status;
-      if (soundLevel !== undefined) node.sound_level = soundLevel;
-      node.last_seen = new Date();
-    }
-  }
-
-  // Push live update to dashboard
-  ioRef?.emit('node:status', { id: nodeId, status, soundLevel });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  HANDLER: Alert event  { nodeId, title, severity, description, soundLevel }
-// ─────────────────────────────────────────────────────────────────────────────
-async function handleAlertEvent(data) {
-  const { nodeId: rawNodeId, title, severity = 'warning', description, soundLevel = 0, threshold = 70.0 } = data;
-  if (!rawNodeId) return;
-
-  // Block message if node is not registered
-  const matchedNode = await getRegisteredNode(rawNodeId);
-  if (!matchedNode) {
-    console.warn(`🛑 [MQTT] Blocked alert event: Node "${rawNodeId}" is not registered.`);
-    return;
-  }
-  const nodeId = matchedNode.id;
-
-  const alert = {
-    id: `alert_${Date.now()}`,
-    node: nodeId,
-    title: title || 'Leak Detected',
-    severity,
-    soundLevel,
-    threshold,
-    description: description || `Acoustic anomaly detected on ${nodeId}`,
-    state: 'active',
-    createdAt: new Date().toISOString(),
-  };
-
-  try {
-    await query(
-      `INSERT INTO alerts (id, node_id, title, severity, sound_level, threshold, state, description, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-      [alert.id, nodeId, alert.title, severity, soundLevel, threshold, 'active', alert.description]
-    );
-  } catch {
-    inMemoryStore.alerts.unshift({
-      id: alert.id,
-      node_id: nodeId,
-      title: alert.title,
-      severity,
-      sound_level: soundLevel,
-      threshold,
-      state: 'active',
-      description: alert.description,
-      created_at: new Date(),
-      resolved_at: null,
-    });
-  }
-
-  ioRef?.emit('alert:new', alert);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Utility: build a consistent alert object
-// ─────────────────────────────────────────────────────────────────────────────
-function buildAlert(nodeId, soundLevel, threshold, alertInfo) {
-  const severity = alertInfo?.severity || (soundLevel >= 85 ? 'critical' : 'warning');
-  const title = alertInfo?.title || (severity === 'critical' ? 'Critical Air Leak' : 'Air Leak Warning');
-  const description = alertInfo?.description || `High acoustic level detected: ${soundLevel.toFixed(1)} dB on ${nodeId}`;
-  return {
-    id: `alert_${Date.now()}`,
-    node: nodeId,
-    title,
-    severity,
-    soundLevel: soundLevel || 0,
-    threshold: threshold || 70,
-    description,
-    state: 'active',
-    createdAt: new Date().toISOString(),
-  };
-}
-
-/**
- * Publish a message to HiveMQ (for future use, e.g. sending commands to ESP32)
- */
-export function mqttPublish(topic, payload) {
-  if (!mqttClient || !mqttConnected) {
-    console.warn('[MQTT] Cannot publish — not connected.');
-    return;
-  }
-  mqttClient.publish(topic, JSON.stringify(payload), { qos: 1 });
 }
 
 export { mqttConnected };

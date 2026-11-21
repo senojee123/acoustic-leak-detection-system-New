@@ -2,7 +2,7 @@
  * =====================================================================================
  *  ESP32 + INMP441 Microphone — Compressed Air Acoustic Leak Detector
  *  Protocol: MQTT → HiveMQ Public Broker (broker.hivemq.com)
- *  Single Topic Architecture: acoustic-leak-detection/sensor-data
+ *  Single Topic Architecture: compressed-air/node1/data
  * =====================================================================================
  *  Hardware Connections (ESP32 <-> INMP441 I2S Microphone):
  *    - VDD   -> 3.3V
@@ -37,10 +37,10 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 // HiveMQ Public Broker (Free & No Account / Certificate Required)
 const char* MQTT_BROKER   = "broker.hivemq.com";
 const int   MQTT_PORT     = 1883;
-const char* MQTT_CLIENT_ID = "esp32-acoustic-leak-node01"; // unique per ESP32
+const char* MQTT_CLIENT_ID = "LeakNode-01"; // unique per ESP32
 
 // Single MQTT Topic (matches Dashboard & Server)
-#define TOPIC_TELEMETRY "acoustic-leak-detection/sensor-data"
+#define MQTT_TOPIC "compressed-air/node1/data"
 
 // Node Identity & Acoustic Threshold
 const char* NODE_ID          = "Node 01";  // Change per device: Node 01, Node 02, etc.
@@ -184,9 +184,9 @@ void publishTelemetry(float soundLevel, bool leakDetected) {
   char payload[350];
   serializeJson(doc, payload);
 
-  bool ok = mqttClient.publish(TOPIC_TELEMETRY, payload, false);
+  bool ok = mqttClient.publish(MQTT_TOPIC, payload, false);
   Serial.printf("[MQTT] %s | Node=%s | sound=%.1f dB | leak=%s | %s\n",
-    TOPIC_TELEMETRY, NODE_ID, soundLevel, leakDetected ? "LEAK" : "OK", ok ? "SENT" : "ERR");
+    MQTT_TOPIC, NODE_ID, soundLevel, leakDetected ? "LEAK" : "OK", ok ? "SENT" : "ERR");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

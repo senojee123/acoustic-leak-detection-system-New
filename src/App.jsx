@@ -53,6 +53,8 @@ export const getApiBase = () => {
   return withProto.replace(/\/+$/, "");
 };
 
+const MQTT_TOPIC = "compressed-air/node1/data";
+
 function App() {
   const [activePage, setActivePage] = useState("dashboard");
 
@@ -197,7 +199,6 @@ function App() {
      HIVEMQ PUBLIC BROKER MQTT & REAL-TIME STREAMING
      ======================================================= */
   const MQTT_BROKER = import.meta.env.VITE_MQTT_BROKER_URL || "wss://broker.hivemq.com:8884/mqtt";
-  const MQTT_TOPIC = import.meta.env.VITE_MQTT_TOPIC || "acoustic-leak-detection/sensor-data";
 
   const lastFeedEventRef = useRef({ key: "", ts: 0 });
 
@@ -396,24 +397,13 @@ function App() {
           setBackendStatus("connected");
           setLoading(false);
 
-          const topicsToSub = [
-            MQTT_TOPIC,
-            "acoustic-leak-detection/#",
-            "acoustic-leak-detection/sensor-data",
-            "acoustic-leak-detection/telemetry",
-            "acoustic-leak-detection/node/+",
-            "compressed-air/sensor",
-            "compressed-air/#"
-          ];
-          topicsToSub.forEach((t) => {
-            mqttClient.subscribe(t, { qos: 0 }, (err) => {
-              if (err) console.error(`❌ [HiveMQ MQTT] Subscription error on ${t}:`, err);
-            });
+          mqttClient.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
+            if (err) console.error(`[HiveMQ MQTT] Subscription error on ${MQTT_TOPIC}:`, err);
           });
-          console.log(`📡 [HiveMQ MQTT] Subscribed to telemetry topics`);
         });
 
         mqttClient.on("message", (topic, payload) => {
+          if (topic !== MQTT_TOPIC) return;
           try {
             const data = JSON.parse(payload.toString());
             console.log(`📥 [HiveMQ MQTT] Telemetry received on ${topic}:`, data);
@@ -693,7 +683,7 @@ function App() {
         socket.disconnect();
       }
     };
-  }, [MQTT_BROKER, MQTT_TOPIC]);
+  }, [MQTT_BROKER]);
 
   /* =======================================================
      RESOLVE ALERT
@@ -1038,7 +1028,7 @@ function Dashboard({
   alerts = [],
   nodes = [],
   leakDetected = false,
-  mqttTopic = "acoustic-leak-detection/sensor-data",
+  mqttTopic = MQTT_TOPIC,
   mqttEvents = [],
   setActivePage,
 }) {
@@ -1253,7 +1243,7 @@ function AcousticStatusCard({
   soundLevel,
   threshold = 70,
   leakDetected = false,
-  mqttTopic = "acoustic-leak-detection/sensor-data",
+  mqttTopic = MQTT_TOPIC,
   lastMqttTime,
   peakDb = 88.5,
 }) {

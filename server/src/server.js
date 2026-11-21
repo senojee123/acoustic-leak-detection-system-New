@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 
 import { initDb, isPostgresConnected } from './config/db.js';
 import { initSocket } from './services/socketService.js';
-import { initMqtt, mqttConnected } from './services/mqttService.js';
+import { initMqtt, mqttConnected, MQTT_TOPIC } from './services/mqttService.js';
 import nodeRoutes from './routes/nodeRoutes.js';
 import alertRoutes from './routes/alertRoutes.js';
 import historyRoutes from './routes/historyRoutes.js';
@@ -72,11 +72,7 @@ app.get('/api/mqtt/status', (req, res) => {
     connected: mqttConnected,
     broker: process.env.HIVEMQ_BROKER_URL || null,
     status: mqttConnected ? 'Connected to HiveMQ' : (process.env.HIVEMQ_BROKER_URL ? 'Connecting / Reconnecting' : 'HIVEMQ_BROKER_URL not set in .env'),
-    topics: [
-      'compressed-air/sensor',
-      'compressed-air/node/+/status',
-      'compressed-air/alert',
-    ],
+    topics: [MQTT_TOPIC],
   });
 });
 
