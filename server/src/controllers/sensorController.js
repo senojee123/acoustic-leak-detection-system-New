@@ -1,8 +1,22 @@
 import { isPostgresConnected, pool, inMemoryStore } from '../config/db.js';
-import { broadcastSensorUpdate, broadcastAlertNew, broadcastNodeStatus } from '../services/socketService.js';
+import { broadcastSensorUpdate, broadcastAlertNew, broadcastNodeStatus, broadcastHistoryNew } from '../services/socketService.js';
 import { deletedNodeIds } from './nodeController.js';
 
 let latestReading = null;
+
+export function clearLatestReadingLeak(nodeId) {
+  if (latestReading) {
+    if (!nodeId || isSameNode(latestReading.nodeId, nodeId)) {
+      latestReading.leakDetected = false;
+      latestReading.status = 'normal';
+      latestReading.soundLevel = 50.0;
+    }
+  }
+}
+
+export function getLatestReading() {
+  return latestReading;
+}
 
 export async function getLatestSensor(req, res) {
   try {
@@ -12,6 +26,28 @@ export async function getLatestSensor(req, res) {
       const configRes = await pool.query('SELECT value FROM system_settings WHERE key = $1', ['config']);
       if (configRes.rows.length > 0) {
         settings = configRes.rows[0].value;
+      }
+    }
+
+    // Ensure latestReading does not falsely report an old resolved leak
+    if (latestReading && latestReading.leakDetected) {
+      let hasActiveAlert = false;
+      if (isPostgresConnected && pool) {
+        const alertCheck = await pool.query(
+          "SELECT COUNT(*) FROM alerts WHERE state = 'active' AND (LOWER(node_id) = LOWER($1) OR LOWER(node_id) = LOWER($2))",
+          [latestReading.nodeId || '', normalizeNodeId(latestReading.nodeId || '')]
+        );
+        hasActiveAlert = parseInt(alertCheck.rows[0].count, 10) > 0;
+      } else {
+        hasActiveAlert = inMemoryStore.alerts.some(
+          a => isSameNode(a.node_id || a.node, latestReading.nodeId) && a.state === 'active'
+        );
+      }
+
+      if (!hasActiveAlert) {
+        latestReading.leakDetected = false;
+        latestReading.status = 'normal';
+        latestReading.soundLevel = 50.0;
       }
     }
 
@@ -157,11 +193,20 @@ export async function ingestReading(req, res) {
 
           // Log to history only when new alert starts
           const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          const historyRecord = {
+            id: `h${Date.now()}`,
+            time: `Today, ${nowStr}`,
+            node: nodeId,
+            event: 'Leak Event Detected',
+            status: 'leak',
+            createdAt: new Date().toISOString(),
+          };
           await pool.query(
             `INSERT INTO history (id, time, node, event, status, created_at)
              VALUES ($1, $2, $3, $4, $5, NOW())`,
-            [`h${Date.now()}`, `Today, ${nowStr}`, nodeId, 'Leak Event Detected', 'leak']
+            [historyRecord.id, historyRecord.time, historyRecord.node, historyRecord.event, historyRecord.status]
           );
+          broadcastHistoryNew(historyRecord);
         }
 
         broadcastAlertNew({
@@ -224,14 +269,17 @@ export async function ingestReading(req, res) {
           inMemoryStore.alerts.unshift(alertObj);
 
           const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          inMemoryStore.history.unshift({
+          const historyRecord = {
             id: `h${Date.now()}`,
             time: `Today, ${nowStr}`,
             node: nodeId,
             event: 'Leak Event Detected',
             status: 'leak',
             created_at: new Date(),
-          });
+            createdAt: new Date().toISOString(),
+          };
+          inMemoryStore.history.unshift(historyRecord);
+          broadcastHistoryNew(historyRecord);
         }
 
         broadcastAlertNew(alertObj);

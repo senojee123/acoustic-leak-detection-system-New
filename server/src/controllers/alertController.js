@@ -1,5 +1,13 @@
 import { isPostgresConnected, pool, inMemoryStore } from '../config/db.js';
-import { broadcastAlertResolved, broadcastAlertNew, broadcastNodeStatus } from '../services/socketService.js';
+import {
+  broadcastAlertResolved,
+  broadcastAlertNew,
+  broadcastAlertDeleted,
+  broadcastNodeStatus,
+  broadcastHistoryNew,
+  broadcastSensorUpdate,
+} from '../services/socketService.js';
+import { clearLatestReadingLeak, getLatestReading } from './sensorController.js';
 
 export async function getAlerts(req, res) {
   const { state } = req.query;
@@ -102,15 +110,27 @@ export async function resolveAlert(req, res) {
           [targetNodeId]
         );
         broadcastNodeStatus({ id: targetNodeId, status: 'normal' });
+        clearLatestReadingLeak(targetNodeId);
+        const latest = getLatestReading();
+        if (latest) broadcastSensorUpdate(latest);
       }
 
       // Add to history
       const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const historyRow = {
+        id: `h${Date.now()}`,
+        time: `Today, ${nowStr}`,
+        node: targetNodeId,
+        event: 'Leak Alert Resolved',
+        status: 'normal',
+        createdAt: new Date().toISOString(),
+      };
       await pool.query(
         `INSERT INTO history (id, time, node, event, status, created_at)
          VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [`h${Date.now()}`, `Today, ${nowStr}`, targetNodeId, 'Leak Alert Resolved', 'normal']
+        [historyRow.id, historyRow.time, historyRow.node, historyRow.event, historyRow.status]
       );
+      broadcastHistoryNew(historyRow);
     } else {
       const alert = inMemoryStore.alerts.find(a => a.id === id);
       if (!alert) {
@@ -143,17 +163,23 @@ export async function resolveAlert(req, res) {
           node.status = 'normal';
           broadcastNodeStatus({ id: targetNodeId, status: 'normal' });
         }
+        clearLatestReadingLeak(targetNodeId);
+        const latest = getLatestReading();
+        if (latest) broadcastSensorUpdate(latest);
       }
 
       const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      inMemoryStore.history.unshift({
+      const historyRow = {
         id: `h${Date.now()}`,
         time: `Today, ${nowStr}`,
         node: targetNodeId,
         event: 'Leak Alert Resolved',
         status: 'normal',
-        created_at: new Date()
-      });
+        created_at: new Date(),
+        createdAt: new Date().toISOString(),
+      };
+      inMemoryStore.history.unshift(historyRow);
+      broadcastHistoryNew(historyRow);
     }
 
     // Broadcast real-time update
@@ -197,11 +223,20 @@ export async function createAlert(req, res) {
 
       // Add to history
       const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const historyRow = {
+        id: `h${Date.now()}`,
+        time: `Today, ${nowStr}`,
+        node,
+        event: 'Leak Event Detected',
+        status: 'leak',
+        createdAt: new Date().toISOString(),
+      };
       await pool.query(
         `INSERT INTO history (id, time, node, event, status, created_at)
          VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [`h${Date.now()}`, `Today, ${nowStr}`, node, 'Leak Event Detected', 'leak']
+        [historyRow.id, historyRow.time, historyRow.node, historyRow.event, historyRow.status]
       );
+      broadcastHistoryNew(historyRow);
 
       const row = result.rows[0];
       createdAlert = {
@@ -241,14 +276,17 @@ export async function createAlert(req, res) {
       }
 
       const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      inMemoryStore.history.unshift({
+      const historyRow = {
         id: `h${Date.now()}`,
         time: `Today, ${nowStr}`,
         node,
         event: 'Leak Event Detected',
         status: 'leak',
-        created_at: new Date()
-      });
+        created_at: new Date(),
+        createdAt: new Date().toISOString(),
+      };
+      inMemoryStore.history.unshift(historyRow);
+      broadcastHistoryNew(historyRow);
     }
 
     broadcastAlertNew(createdAlert);
@@ -294,6 +332,9 @@ export async function deleteAlert(req, res) {
           [targetNodeId]
         );
         broadcastNodeStatus({ id: targetNodeId, status: 'normal' });
+        clearLatestReadingLeak(targetNodeId);
+        const latest = getLatestReading();
+        if (latest) broadcastSensorUpdate(latest);
       }
     } else {
       const alertIndex = inMemoryStore.alerts.findIndex(a => a.id === id);
@@ -313,8 +354,14 @@ export async function deleteAlert(req, res) {
           node.status = 'normal';
           broadcastNodeStatus({ id: targetNodeId, status: 'normal' });
         }
+        clearLatestReadingLeak(targetNodeId);
+        const latest = getLatestReading();
+        if (latest) broadcastSensorUpdate(latest);
       }
     }
+
+    // Broadcast alert deletion to all connected clients
+    broadcastAlertDeleted(id, targetNodeId);
 
     return res.json({
       success: true,

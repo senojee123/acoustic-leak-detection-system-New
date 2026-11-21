@@ -1,4 +1,6 @@
 import { isPostgresConnected, pool, inMemoryStore } from '../config/db.js';
+import { broadcastNodeCreated, broadcastNodeUpdated, broadcastNodeDeleted } from '../services/socketService.js';
+import { clearLatestReadingLeak } from './sensorController.js';
 
 // Set of explicitly deleted node IDs to prevent telemetry from immediately resurrecting them
 export const deletedNodeIds = new Set();
@@ -93,9 +95,12 @@ export async function createNode(req, res) {
         [id, name, location, locationImage, description]
       );
 
+      const createdNode = { id, name, status: 'normal', soundLevel: 0, lastSeen: new Date().toISOString(), location, locationImage, description };
+      broadcastNodeCreated(createdNode);
+
       return res.status(201).json({
         success: true,
-        node: { id, name, status: 'normal', soundLevel: 0, lastSeen: new Date().toISOString(), location, locationImage, description },
+        node: createdNode,
       });
     }
 
@@ -118,6 +123,7 @@ export async function createNode(req, res) {
       description,
     };
     inMemoryStore.nodes.push(newNode);
+    broadcastNodeCreated(newNode);
 
     return res.status(201).json({ success: true, node: newNode });
   } catch (err) {
@@ -142,18 +148,21 @@ export async function updateNode(req, res) {
           [id, name || id, location || '', locationImage || '', description || '']
         );
 
+        const upsertedNode = {
+          id,
+          name: name || id,
+          status: 'normal',
+          soundLevel: 0,
+          lastSeen: new Date().toISOString(),
+          location: location || '',
+          locationImage: locationImage || '',
+          description: description || '',
+        };
+        broadcastNodeCreated(upsertedNode);
+
         return res.json({
           success: true,
-          node: {
-            id,
-            name: name || id,
-            status: 'normal',
-            soundLevel: 0,
-            lastSeen: new Date().toISOString(),
-            location: location || '',
-            locationImage: locationImage || '',
-            description: description || '',
-          },
+          node: upsertedNode,
         });
       }
 
@@ -190,18 +199,21 @@ export async function updateNode(req, res) {
 
       const updated = await pool.query('SELECT * FROM nodes WHERE LOWER(id) = LOWER($1)', [id]);
       const row = updated.rows[0];
+      const updatedNode = {
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        soundLevel: parseFloat(row.sound_level) || 0,
+        lastSeen: row.last_seen,
+        location: row.location || '',
+        locationImage: row.location_image || '',
+        description: row.description || '',
+      };
+      broadcastNodeUpdated(updatedNode);
+
       return res.json({
         success: true,
-        node: {
-          id: row.id,
-          name: row.name,
-          status: row.status,
-          soundLevel: parseFloat(row.sound_level) || 0,
-          lastSeen: row.last_seen,
-          location: row.location || '',
-          locationImage: row.location_image || '',
-          description: row.description || '',
-        },
+        node: updatedNode,
       });
     }
 
@@ -221,6 +233,7 @@ export async function updateNode(req, res) {
         description: description || '',
       };
       inMemoryStore.nodes.push(node);
+      broadcastNodeCreated(node);
       return res.json({ success: true, node });
     }
 
@@ -229,6 +242,7 @@ export async function updateNode(req, res) {
     if (locationImage !== undefined) node.locationImage = locationImage;
     if (description !== undefined) node.description = description;
 
+    broadcastNodeUpdated(node);
     return res.json({ success: true, node });
   } catch (err) {
     console.error('Error updating node:', err);
@@ -253,6 +267,8 @@ export async function deleteNode(req, res) {
 
       // Cascade will handle related alerts
       await pool.query('DELETE FROM nodes WHERE id = $1', [id]);
+      clearLatestReadingLeak(id);
+      broadcastNodeDeleted(id);
       return res.json({ success: true, message: `Node "${id}" deleted` });
     }
 
@@ -265,6 +281,8 @@ export async function deleteNode(req, res) {
 
     // Also remove any alerts tied to this node
     inMemoryStore.alerts = inMemoryStore.alerts.filter(a => a.node_id !== id);
+    clearLatestReadingLeak(id);
+    broadcastNodeDeleted(id);
 
     return res.json({ success: true, message: `Node "${id}" deleted` });
   } catch (err) {

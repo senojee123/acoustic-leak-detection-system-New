@@ -35,9 +35,39 @@ export function broadcastAlertResolved(alert) {
   }
 }
 
+export function broadcastAlertDeleted(id, nodeId) {
+  if (ioInstance) {
+    ioInstance.emit('alert:deleted', { id, nodeId });
+  }
+}
+
 export function broadcastNodeStatus(node) {
   if (ioInstance) {
     ioInstance.emit('node:status', node);
+  }
+}
+
+export function broadcastNodeCreated(node) {
+  if (ioInstance) {
+    ioInstance.emit('node:created', node);
+  }
+}
+
+export function broadcastNodeUpdated(node) {
+  if (ioInstance) {
+    ioInstance.emit('node:updated', node);
+  }
+}
+
+export function broadcastNodeDeleted(id) {
+  if (ioInstance) {
+    ioInstance.emit('node:deleted', { id });
+  }
+}
+
+export function broadcastHistoryNew(historyRecord) {
+  if (ioInstance) {
+    ioInstance.emit('history:new', historyRecord);
   }
 }
 

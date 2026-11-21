@@ -46,6 +46,13 @@ export const isSameNode = (id1, id2) => {
   return normalizeNodeId(id1) === normalizeNodeId(id2);
 };
 
+export const getApiBase = () => {
+  const raw = import.meta.env.VITE_API_URL?.trim();
+  if (!raw) return "";
+  const withProto = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
+  return withProto.replace(/\/+$/, "");
+};
+
 function App() {
   const [activePage, setActivePage] = useState("dashboard");
 
@@ -195,7 +202,7 @@ function App() {
   const lastFeedEventRef = useRef({ key: "", ts: 0 });
 
   useEffect(() => {
-    const API_BASE = import.meta.env.VITE_API_URL || "";
+    const API_BASE = getApiBase();
     let mqttClient = null;
 
     // Helper: Process incoming telemetry from ESP32 via MQTT (or fallback REST / Socket.io)
@@ -443,28 +450,46 @@ function App() {
         socket.on("connect", () => {
           console.log("🔌 [Socket.io] Connected to server backend");
         });
+
         socket.on("sensor:update", (reading) => {
           console.log("📥 [Socket.io] sensor:update:", reading);
           processTelemetry(reading);
         });
+
         socket.on("node:status", (statusUpdate) => {
-          if (statusUpdate?.id) {
-            processTelemetry({
-              nodeId: statusUpdate.id,
-              status: statusUpdate.status,
-              soundLevel: statusUpdate.soundLevel,
+          if (!statusUpdate?.id) return;
+          setNodes((currentNodes) => {
+            const updated = currentNodes.map((n) =>
+              isSameNode(n.id, statusUpdate.id)
+                ? {
+                    ...n,
+                    status: statusUpdate.status || n.status,
+                    soundLevel: statusUpdate.soundLevel !== undefined ? statusUpdate.soundLevel : n.soundLevel,
+                    lastSeen: new Date().toISOString(),
+                  }
+                : n
+            );
+            try { localStorage.setItem("cached_nodes", JSON.stringify(updated)); } catch {}
+            return updated;
+          });
+
+          if (statusUpdate.status === "normal") {
+            setAlerts((currentAlerts) => {
+              const hasActive = currentAlerts.some((a) => a.state === "active");
+              if (!hasActive) setLeakDetected(false);
+              return currentAlerts;
             });
           }
         });
+
         socket.on("alert:new", (newAlert) => {
           if (!newAlert) return;
-          const targetNode = String(newAlert.node || newAlert.node_id || "").toLowerCase();
+          const targetNode = newAlert.node || newAlert.node_id || "";
 
           setAlerts((currentAlerts) => {
             const existingIdx = currentAlerts.findIndex((a) => {
               if (a.id === newAlert.id) return true;
-              const aNode = String(a.node || a.node_id || "").toLowerCase();
-              return aNode === targetNode && a.state === "active";
+              return isSameNode(a.node || a.node_id, targetNode) && a.state === "active";
             });
 
             let updated;
@@ -473,7 +498,7 @@ function App() {
               updated[existingIdx] = {
                 ...updated[existingIdx],
                 ...newAlert,
-                node: newAlert.node || newAlert.node_id || updated[existingIdx].node,
+                node: targetNode || updated[existingIdx].node,
               };
             } else {
               updated = [newAlert, ...currentAlerts];
@@ -481,16 +506,180 @@ function App() {
             try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch {}
             return updated;
           });
+
+          setLeakDetected(true);
+
+          if (targetNode) {
+            setNodes((currentNodes) => {
+              const updated = currentNodes.map((n) =>
+                isSameNode(n.id, targetNode)
+                  ? {
+                      ...n,
+                      status: "leak",
+                      soundLevel: newAlert.soundLevel !== undefined ? newAlert.soundLevel : n.soundLevel,
+                      lastSeen: new Date().toISOString(),
+                    }
+                  : n
+              );
+              try { localStorage.setItem("cached_nodes", JSON.stringify(updated)); } catch {}
+              return updated;
+            });
+          }
+        });
+
+        socket.on("alert:resolved", (resolvedAlert) => {
+          if (!resolvedAlert) return;
+          const targetNode = resolvedAlert.node || resolvedAlert.node_id;
+
+          setAlerts((currentAlerts) => {
+            const updated = currentAlerts.map((a) =>
+              a.id === resolvedAlert.id
+                ? { ...a, state: "resolved", resolvedAt: resolvedAlert.resolvedAt || new Date().toISOString() }
+                : a
+            );
+            try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch {}
+
+            const anyActiveRemain = updated.some((a) => a.state === "active");
+            if (!anyActiveRemain) setLeakDetected(false);
+
+            if (targetNode) {
+              const nodeHasOtherActive = updated.some(
+                (a) => isSameNode(a.node || a.node_id, targetNode) && a.state === "active"
+              );
+              if (!nodeHasOtherActive) {
+                setNodes((currentNodes) => {
+                  const updatedNodes = currentNodes.map((n) =>
+                    isSameNode(n.id, targetNode) ? { ...n, status: "normal" } : n
+                  );
+                  try { localStorage.setItem("cached_nodes", JSON.stringify(updatedNodes)); } catch {}
+                  return updatedNodes;
+                });
+              }
+            }
+            return updated;
+          });
+
+          setSelectedAlert((prev) => (prev?.id === resolvedAlert.id ? { ...prev, state: "resolved" } : prev));
+        });
+
+        socket.on("alert:deleted", ({ id, nodeId }) => {
+          if (!id) return;
+
+          setAlerts((currentAlerts) => {
+            const updated = currentAlerts.filter((a) => a.id !== id);
+            try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch {}
+
+            const anyActiveRemain = updated.some((a) => a.state === "active");
+            if (!anyActiveRemain) setLeakDetected(false);
+
+            if (nodeId) {
+              const nodeHasOtherActive = updated.some(
+                (a) => isSameNode(a.node || a.node_id, nodeId) && a.state === "active"
+              );
+              if (!nodeHasOtherActive) {
+                setNodes((currentNodes) => {
+                  const updatedNodes = currentNodes.map((n) =>
+                    isSameNode(n.id, nodeId) ? { ...n, status: "normal" } : n
+                  );
+                  try { localStorage.setItem("cached_nodes", JSON.stringify(updatedNodes)); } catch {}
+                  return updatedNodes;
+                });
+              }
+            }
+            return updated;
+          });
+
+          setSelectedAlert((prev) => (prev?.id === id ? null : prev));
+        });
+
+        socket.on("node:created", (newNode) => {
+          if (!newNode?.id) return;
+          setNodes((currentNodes) => {
+            if (currentNodes.some((n) => isSameNode(n.id, newNode.id))) return currentNodes;
+            const updated = [...currentNodes, newNode];
+            try { localStorage.setItem("cached_nodes", JSON.stringify(updated)); } catch {}
+            return updated;
+          });
+        });
+
+        socket.on("node:updated", (updatedNode) => {
+          if (!updatedNode?.id) return;
+          setNodes((currentNodes) => {
+            const updated = currentNodes.map((n) =>
+              isSameNode(n.id, updatedNode.id) ? { ...n, ...updatedNode } : n
+            );
+            try { localStorage.setItem("cached_nodes", JSON.stringify(updated)); } catch {}
+            return updated;
+          });
+        });
+
+        socket.on("node:deleted", ({ id }) => {
+          if (!id) return;
+          setNodes((currentNodes) => {
+            const updated = currentNodes.filter((n) => !isSameNode(n.id, id));
+            try { localStorage.setItem("cached_nodes", JSON.stringify(updated)); } catch {}
+            return updated;
+          });
+          setAlerts((currentAlerts) => {
+            const updated = currentAlerts.filter((a) => !isSameNode(a.node || a.node_id, id));
+            try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch {}
+            return updated;
+          });
+        });
+
+        socket.on("history:new", (newRecord) => {
+          if (!newRecord) return;
+          setHistoryRecords((prev) => [newRecord, ...prev.filter((h) => h.id !== newRecord.id)].slice(0, 100));
         });
       } catch (e) {
         console.warn("Socket.io connection error:", e);
       }
 
-      // Initial REST API fetch
+      // Initial Sync: Load registered nodes, alerts, and history from backend
+      fetch(`${API_BASE}/api/nodes`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (Array.isArray(data)) {
+            setNodes(data);
+            nodesRef.current = data;
+            try { localStorage.setItem("cached_nodes", JSON.stringify(data)); } catch {}
+          }
+        })
+        .catch((err) => console.warn("Failed to load nodes from backend:", err));
+
+      fetch(`${API_BASE}/api/alerts`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (Array.isArray(data)) {
+            setAlerts(data);
+            try { localStorage.setItem("cached_alerts", JSON.stringify(data)); } catch {}
+            const hasActive = data.some((a) => a.state === "active");
+            setLeakDetected(hasActive);
+          }
+        })
+        .catch((err) => console.warn("Failed to load alerts from backend:", err));
+
+      fetch(`${API_BASE}/api/history`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (Array.isArray(data)) {
+            setHistoryRecords(data);
+          }
+        })
+        .catch((err) => console.warn("Failed to load history from backend:", err));
+
+      // Initial sensor gauge reading (without synthesizing duplicate phantom alerts)
       fetch(`${API_BASE}/api/sensor/latest`)
         .then((r) => r.json())
         .then((res) => {
-          if (res?.sensor) processTelemetry(res.sensor);
+          if (res?.sensor) {
+            if (res.sensor.soundLevel !== undefined && res.sensor.soundLevel !== null && !isNaN(parseFloat(res.sensor.soundLevel))) {
+              setSoundLevel(parseFloat(res.sensor.soundLevel));
+            }
+            if (res.sensor.threshold !== undefined && res.sensor.threshold !== null && !isNaN(parseFloat(res.sensor.threshold))) {
+              setThreshold(parseFloat(res.sensor.threshold));
+            }
+          }
         })
         .catch(() => { });
     }
@@ -510,7 +699,7 @@ function App() {
      RESOLVE ALERT
      ======================================================= */
   async function resolveAlert(id) {
-    const API_BASE = import.meta.env.VITE_API_URL || "";
+    const API_BASE = getApiBase();
 
     // Use functional updater to get the current alert before changing state
     let resolvedNodeId = null;
@@ -528,14 +717,20 @@ function App() {
 
       // Check if this node has any OTHER active alerts remaining
       const nodeStillHasActive = updated.some(
-        (a) => a.node === resolvedNodeId && a.state === "active"
+        (a) => isSameNode(a.node || a.node_id, resolvedNodeId) && a.state === "active"
       );
+
+      // Check if ANY active alert remains in the whole system
+      const systemHasActive = updated.some((a) => a.state === "active");
+      if (!systemHasActive) {
+        setLeakDetected(false);
+      }
 
       // Update nodes status if no other active alerts remain for this node
       if (resolvedNodeId && !nodeStillHasActive) {
         setNodes((currentNodes) => {
           const updatedNodes = currentNodes.map((n) =>
-            n.id === resolvedNodeId ? { ...n, status: "normal" } : n
+            isSameNode(n.id, resolvedNodeId) ? { ...n, status: "normal" } : n
           );
           try { localStorage.setItem("cached_nodes", JSON.stringify(updatedNodes)); } catch { }
           return updatedNodes;
@@ -578,7 +773,7 @@ function App() {
      DELETE ALERT
      ======================================================= */
   async function deleteAlert(id) {
-    const API_BASE = import.meta.env.VITE_API_URL || "";
+    const API_BASE = getApiBase();
 
     // If the deleted alert is currently selected, close the details panel
     if (selectedAlert?.id === id) {
@@ -587,26 +782,35 @@ function App() {
 
     // Optimistic UI update — remove alert from state
     const deletedAlert = alerts.find((a) => a.id === id);
+    const targetNodeId = deletedAlert?.node || deletedAlert?.node_id;
+
     setAlerts((currentAlerts) => {
       const updated = currentAlerts.filter((alert) => alert.id !== id);
       try { localStorage.setItem("cached_alerts", JSON.stringify(updated)); } catch { }
-      return updated;
-    });
 
-    // If the deleted alert was active and no other active alerts remain for that node, reset node
-    if (deletedAlert && deletedAlert.state === "active") {
-      setNodes((currentNodes) => {
-        const otherActive = alerts.some(
-          (a) => a.id !== id && a.node === deletedAlert.node && a.state === "active"
+      const systemHasActive = updated.some((a) => a.state === "active");
+      if (!systemHasActive) {
+        setLeakDetected(false);
+      }
+
+      // If the deleted alert was active and no other active alerts remain for that node, reset node
+      if (deletedAlert?.state === "active" && targetNodeId) {
+        const otherActive = updated.some(
+          (a) => isSameNode(a.node || a.node_id, targetNodeId) && a.state === "active"
         );
         if (!otherActive) {
-          return currentNodes.map((n) =>
-            n.id === deletedAlert.node ? { ...n, status: "normal" } : n
-          );
+          setNodes((currentNodes) => {
+            const updatedNodes = currentNodes.map((n) =>
+              isSameNode(n.id, targetNodeId) ? { ...n, status: "normal" } : n
+            );
+            try { localStorage.setItem("cached_nodes", JSON.stringify(updatedNodes)); } catch { }
+            return updatedNodes;
+          });
         }
-        return currentNodes;
-      });
-    }
+      }
+
+      return updated;
+    });
 
     // Sync with backend
     if (API_BASE) {
@@ -2264,7 +2468,7 @@ function NodesPage({ nodes = [], setNodes, alerts = [], onDeleteNode, onRegister
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef(null);
 
-  const API_BASE = import.meta.env.VITE_API_URL || "";
+  const API_BASE = getApiBase();
 
   /* --- Image processing helper --- */
   function processImageFile(file) {
